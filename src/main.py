@@ -1,7 +1,10 @@
 import argparse
+import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 
@@ -85,21 +88,67 @@ def create_parser():
     return p
 
 
+def build_package_url(repo, package, version):
+    base = repo.rstrip("/")
+    return f"{base}/{package}/{version}"
+
+
+def fetch_package_data(url):
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw_data = resp.read().decode("utf-8")
+            return json.loads(raw_data)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            msg = f"Ошибка: пакет или версия не найдены ({url})."
+        else:
+            msg = f"Ошибка HTTP {e.code} при запросе к {url}."
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        msg = f"Ошибка сети: не удалось подключиться ({e.reason})."
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print("Ошибка: некорректный JSON от сервера.", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_direct_dependencies(repo, package, version):
+    url = build_package_url(repo, package, version)
+    data = fetch_package_data(url)
+    deps = data.get("dependencies", {})
+    if not isinstance(deps, dict):
+        return {}
+    return deps
+
+
+def print_direct_dependencies(package, version, deps):
+    if not deps:
+        msg = f"У пакета {package}@{version} нет прямых зависимостей."
+        print(msg)
+        return
+
+    print(f"Прямые зависимости пакета {package}@{version}:")
+    for dep_name, dep_ver in deps.items():
+        print(f"  - {dep_name}: {dep_ver}")
+
+
 def main():
     args = create_parser().parse_args()
     validate_args(args)
 
-    config = {
-        "package": args.package,
-        "repo": args.repo,
-        "test_mode": args.test_mode == "true",
-        "version": args.version,
-        "output": args.output,
-        "max_depth": int(args.max_depth),
-        "filter": args.filter_substr or "",
-    }
-    for key, val in config.items():
-        print(f"{key}: {val}")
+    if args.test_mode == "true":
+        print("Работа с тестовым файлом реализуется на этапе 3.")
+        return
+
+    deps = get_direct_dependencies(
+        args.repo, args.package, args.version
+    )
+    print_direct_dependencies(args.package, args.version, deps)
 
 
 if __name__ == "__main__":

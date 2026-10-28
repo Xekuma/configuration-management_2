@@ -96,14 +96,22 @@ filter: debug
 
 ---
 
-## Этап 2. Сбор данных *(в разработке)*
+## Этап 2. Сбор данных
 
-**Цель этапа:** реализовать получение данных о прямых зависимостях пакета формата JavaScript (`npm`) для заданной версии по URL-адресу репозитория без использования менеджеров пакетов и сторонних библиотек.
+### Цель этапа
+Реализовать получение данных о прямых зависимостях пакета для заданной версии из репозитория формата `npm` без использования менеджеров пакетов и сторонних библиотек.
 
-* **План реализации:**
-  * Формирование HTTP GET-запроса к `npm` registry (`<repo>/<package>/<version>`) с помощью `urllib.request`.
-  * Парсинг полученного JSON-ответа (`json.loads`) и извлечение словаря `dependencies`.
-  * Вывод списка прямых зависимостей и их версий в консоль.
+### Реализация
+* **`build_package_url(repo, package, version)`** — формирует конечный URL к эндпоинту реестра вида `<repo>/<package>/<version>`.
+* **`fetch_package_data(url)`** — выполняет HTTP GET-запрос средствами стандартной библиотеки `urllib.request`, декодирует JSON-ответ и перехватывает сетевые ошибки (`HTTPError`, `URLError`, `JSONDecodeError`).
+* **`get_direct_dependencies(repo, package, version)`** — извлекает словарь прямых зависимостей из поля `"dependencies"` метаданных пакета.
+* **`print_direct_dependencies(package, version, deps)`** — выводит список прямых зависимостей и их версий в консоль.
+
+### Примеры запуска
+Получение зависимостей пакета `express@4.19.2`:
+```powershell
+python main.py --package express --repo [https://registry.npmjs.org](https://registry.npmjs.org) --test-mode false --version 4.19.2 --output graph.svg --max-depth 3
+```
 
 ---
 

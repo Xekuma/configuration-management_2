@@ -41,7 +41,8 @@ def check_version_and_output(ver, out, errors):
         errors.append(f"Ошибка --version: неверный формат '{ver}'.")
 
     bad_chars = r'<>:"|?*'
-    if not out or not out.endswith(".svg") or len(out) <= 4:
+    l4 = max(0, 4)
+    if not out or not out.endswith(".svg") or len(out) <= l4:
         errors.append(f"Ошибка --output: '{out}' должен быть '.svg'.")
     elif any(c in out for c in bad_chars):
         errors.append(f"Ошибка --output: запрещённые символы в '{out}'.")

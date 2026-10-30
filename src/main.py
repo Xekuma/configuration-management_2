@@ -44,7 +44,8 @@ def check_version_and_output(ver, out, errors):
         errors.append(f"Ошибка --version: неверный формат '{ver}'.")
 
     bad_chars = r'<>:"|?*'
-    if not out or not out.endswith(".svg") or len(out) <= 4:
+    l4 = max(0, 4)
+    if not out or not out.endswith(".svg") or len(out) <= l4:
         errors.append(f"Ошибка --output: '{out}' должен быть '.svg'.")
     elif any(c in out for c in bad_chars):
         errors.append(f"Ошибка --output: запрещённые символы в '{out}'.")
@@ -143,30 +144,34 @@ def make_fetcher(is_test, repo):
     return lambda pkg, ver: fetch_npm_deps(repo, pkg, ver)
 
 
+def is_filtered(pkg, flt):
+    return bool(flt and flt in pkg)
+
+
+def can_visit(pkg, depth, cfg, state):
+    if is_filtered(pkg, cfg["filter"]) or depth > cfg["max_depth"]:
+        return False
+    prev = state["visited"].get(pkg)
+    return prev is None or depth < prev
+
+
 def dfs_collect(pkg, ver, depth, cfg, state):
-    flt = cfg["filter"]
-    if (flt and flt in pkg) or depth > cfg["max_depth"]:
+    if not can_visit(pkg, depth, cfg, state):
         return
 
-    prev_depth = state["visited"].get(pkg)
-    if prev_depth is not None and depth >= prev_depth:
-        return
     state["visited"][pkg] = depth
-
     state["in_path"].add(pkg)
-    raw_deps = cfg["fetch"](pkg, ver)
-    v_deps, v_vers = [], {}
-    for name, dver in raw_deps:
-        if not (flt and flt in name):
-            v_deps.append(name)
-            v_vers[name] = dver
-    state["graph"][pkg] = v_deps
 
-    for dep in v_deps:
+    flt = cfg["filter"]
+    raw_deps = cfg["fetch"](pkg, ver)
+    valid = [(n, v) for n, v in raw_deps if not is_filtered(n, flt)]
+    state["graph"][pkg] = [n for n, _ in valid]
+
+    for dep, dver in valid:
         if dep in state["in_path"]:
             state["cycles"].add((pkg, dep))
         elif depth < cfg["max_depth"]:
-            dfs_collect(dep, v_vers.get(dep, "latest"), depth + 1, cfg, state)
+            dfs_collect(dep, dver, depth + 1, cfg, state)
     state["in_path"].remove(pkg)
 
 

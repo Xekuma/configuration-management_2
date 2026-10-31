@@ -39,7 +39,7 @@ def check_repo(repo, is_test, errors):
 
 
 def check_version_and_output(ver, out, errors):
-    ver_pat = r"^(\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?|latest)$"
+    ver_pat = r"^(\d+(\.\d+){1,2}(-[a-zA-Z0-9.-]+)?|latest)$"
     if not ver or not re.match(ver_pat, ver):
         errors.append(f"Ошибка --version: неверный формат '{ver}'.")
 
@@ -63,6 +63,12 @@ def check_depth_and_filter(depth_str, flt, errors):
             errors.append(f"Ошибка --filter: недопустимая строка '{flt}'.")
 
 
+def check_reverse(val, errors):
+    if val not in ("true", "false"):
+        msg = f"Ошибка --reverse: нужно 'true'/'false', дано '{val}'."
+        errors.append(msg)
+
+
 def validate_args(args):
     errors = []
     is_test = check_test_mode(args.test_mode, errors)
@@ -70,6 +76,7 @@ def validate_args(args):
     check_repo(args.repo, is_test, errors)
     check_version_and_output(args.version, args.output, errors)
     check_depth_and_filter(args.max_depth, args.filter_substr, errors)
+    check_reverse(args.reverse, errors)
 
     if errors:
         for err in errors:
@@ -86,6 +93,7 @@ def create_parser():
     p.add_argument("--output", required=True, help="Имя SVG-файла.")
     p.add_argument("--max-depth", required=True, help="Глубина анализа.")
     p.add_argument("--filter", dest="filter_substr", default=None)
+    p.add_argument("--reverse", default="false", help="Обратные: true/false.")
     return p
 
 
@@ -107,10 +115,7 @@ def fetch_npm_deps(repo, package, version):
             deps = data.get("dependencies", {})
             if not isinstance(deps, dict):
                 return []
-            res = []
-            for name, vspec in deps.items():
-                res.append((name, clean_version(vspec)))
-            return res
+            return [(k, clean_version(v)) for k, v in deps.items()]
     except urllib.error.HTTPError as e:
         print(f"Ошибка HTTP {e.code}: {package}@{version}", file=sys.stderr)
         return []
@@ -119,28 +124,137 @@ def fetch_npm_deps(repo, package, version):
         return []
 
 
+def fetch_npm_reverse(repo, package):
+    base = repo.rstrip("/")
+    url = f"{base}/-/v1/search?text={package}&size=6"
+    hdrs = {"Accept": "application/json", "User-Agent": "DepGraphCLI/1.0"}
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            res = []
+            for item in data.get("objects", []):
+                pkg = item.get("package", {})
+                name = pkg.get("name")
+                ver = clean_version(pkg.get("version", "latest"))
+                if name and name != package:
+                    res.append((name, ver))
+            return res
+    except Exception as e:
+        print(f"Ошибка поиска обратных для {package}: {e}", file=sys.stderr)
+        return []
+
+
+def ver_tuple(v_str):
+    nums = [int(x) for x in re.findall(r"\d+", str(v_str))]
+    return tuple(nums) if nums else (0,)
+
+
+def match_ver(v_str, op, target):
+    v, t = ver_tuple(v_str), ver_tuple(target)
+    ops = {
+        "==": v == t, "=": v == t, ">=": v >= t,
+        "<=": v <= t, ">": v > t, "<": v < t,
+    }
+    return ops.get(op, v == t)
+
+
+def parse_pkg_def(raw_left):
+    m = re.match(r"^([A-Z]+)(?:v|@)?(\d+(?:\.\d+)*)?$", raw_left.strip())
+    if not m:
+        return raw_left.strip(), "latest"
+    return m.group(1), (m.group(2) or "latest")
+
+
+def parse_dep_tokens(deps_str):
+    pat = r"([A-Z]+)(?:(>=|<=|==|=|>|<|v|@)(\d+(?:\.\d+)*))?"
+    res = []
+    for name, op, ver in re.findall(pat, deps_str):
+        norm_op = "==" if op in ("v", "@", "=") else (op or "any")
+        res.append((name, norm_op, ver or "latest"))
+    return res
+
+
 def load_test_repo(file_path):
-    graph = {}
+    repo_data = {}
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
+            for raw in f:
+                line = raw.strip()
                 if not line or line.startswith("#") or ":" not in line:
                     continue
-                pkg, deps_str = line.split(":", 1)
-                pkg = pkg.strip()
-                deps = re.findall(r"[A-Z]+", deps_str)
-                graph[pkg] = deps
+                left, right = line.split(":", 1)
+                pkg, ver = parse_pkg_def(left)
+                deps = parse_dep_tokens(right)
+                repo_data.setdefault(pkg, {})[ver] = deps
     except OSError as e:
         print(f"Ошибка чтения файла '{file_path}': {e}", file=sys.stderr)
         sys.exit(1)
-    return graph
+    return repo_data
 
 
-def make_fetcher(is_test, repo):
+def resolve_test_ver(repo_data, pkg, op, target_ver):
+    versions = list(repo_data.get(pkg, {}).keys())
+    if not versions:
+        return None
+    if op == "any" or target_ver == "latest":
+        return max(versions, key=ver_tuple)
+    matched = [v for v in versions if match_ver(v, op, target_ver)]
+    return max(matched, key=ver_tuple) if matched else None
+
+
+def fmt_test_node(pkg, ver, repo_data):
+    vers = repo_data.get(pkg, {})
+    if ver == "latest" and "latest" in vers:
+        return pkg
+    return f"{pkg}v{ver}" if ver and ver != "latest" else pkg
+
+
+def build_resolved_test_graph(repo_data):
+    resolved = {}
+    for pkg, vers_dict in repo_data.items():
+        for ver, specs in vers_dict.items():
+            src = fmt_test_node(pkg, ver, repo_data)
+            resolved[src] = []
+            for d_pkg, op, d_ver in specs:
+                r_ver = resolve_test_ver(repo_data, d_pkg, op, d_ver)
+                if r_ver is not None:
+                    dst = fmt_test_node(d_pkg, r_ver, repo_data)
+                    resolved[src].append((dst, r_ver))
+    return resolved
+
+
+def invert_resolved_graph(resolved):
+    rev = {node: [] for node in resolved}
+    for src, targets in resolved.items():
+        for dst, _ in targets:
+            rev.setdefault(dst, []).append((src, "latest"))
+    return rev
+
+
+def make_test_fetcher(file_path, is_reverse):
+    repo_data = load_test_repo(file_path)
+    resolved = build_resolved_test_graph(repo_data)
+    if is_reverse:
+        resolved = invert_resolved_graph(resolved)
+    return repo_data, (lambda node, _ver: resolved.get(node, []))
+
+
+def get_start_test_node(repo_data, pkg, ver):
+    if pkg not in repo_data:
+        return pkg
+    r_ver = resolve_test_ver(repo_data, pkg, "==", ver)
+    if r_ver is None:
+        r_ver = resolve_test_ver(repo_data, pkg, "any", "latest")
+    return fmt_test_node(pkg, r_ver, repo_data)
+
+
+def make_fetcher(is_test, repo, is_reverse=False):
     if is_test:
-        test_data = load_test_repo(repo)
-        return lambda pkg, _ver: [(d, "latest") for d in test_data.get(pkg, [])]
+        _, fetcher = make_test_fetcher(repo, is_reverse)
+        return fetcher
+    if is_reverse:
+        return lambda pkg, _ver: fetch_npm_reverse(repo, pkg)
     return lambda pkg, ver: fetch_npm_deps(repo, pkg, ver)
 
 
@@ -177,14 +291,44 @@ def dfs_collect(pkg, ver, depth, cfg, state):
 
 def build_dependency_graph(args):
     is_test = args.test_mode == "true"
+    is_rev = args.reverse == "true"
+    start_pkg = args.package
+    if is_test:
+        repo_data, fetch_fn = make_test_fetcher(args.repo, is_rev)
+        start_pkg = get_start_test_node(repo_data, args.package, args.version)
+    else:
+        fetch_fn = make_fetcher(False, args.repo, is_rev)
+
     cfg = {
         "max_depth": int(args.max_depth),
         "filter": args.filter_substr,
-        "fetch": make_fetcher(is_test, args.repo),
+        "fetch": fetch_fn,
     }
     state = {"graph": {}, "visited": {}, "in_path": set(), "cycles": set()}
-    dfs_collect(args.package, args.version, 1, cfg, state)
-    return state["graph"], state["cycles"]
+    dfs_collect(start_pkg, args.version, 1, cfg, state)
+    return start_pkg, state["graph"], state["cycles"]
+
+
+def print_reverse_results(target, graph, cycles):
+    deps_set = set()
+    for pkg, deps in graph.items():
+        if pkg != target:
+            deps_set.add(pkg)
+        deps_set.update(d for d in deps if d != target)
+    dependents = sorted(deps_set)
+    if not dependents:
+        print(f"Обратные зависимости для пакета {target} не найдены.")
+        return
+    print(f"Обратные зависимости для пакета {target}:")
+    print(f"  Пакеты, зависящие от {target}: {', '.join(dependents)}")
+    print("\nГраф обратных связей (от кого <- кто зависит):")
+    for pkg, deps in graph.items():
+        deps_str = ", ".join(deps) if deps else "нет"
+        print(f"  {pkg} <- [{deps_str}]")
+    if cycles:
+        print("\nОбнаружены циклические зависимости:")
+        for src, dst in sorted(cycles):
+            print(f"  {src} <- {dst} (цикл)")
 
 
 def print_results(graph, cycles):
@@ -204,8 +348,11 @@ def print_results(graph, cycles):
 def main():
     args = create_parser().parse_args()
     validate_args(args)
-    graph, cycles = build_dependency_graph(args)
-    print_results(graph, cycles)
+    start_pkg, graph, cycles = build_dependency_graph(args)
+    if args.reverse == "true":
+        print_reverse_results(start_pkg, graph, cycles)
+    else:
+        print_results(graph, cycles)
 
 
 if __name__ == "__main__":

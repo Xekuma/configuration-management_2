@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -44,8 +46,7 @@ def check_version_and_output(ver, out, errors):
         errors.append(f"Ошибка --version: неверный формат '{ver}'.")
 
     bad_chars = r'<>:"|?*'
-    l4 = max(0, 4)
-    if not out or not out.endswith(".svg") or len(out) <= l4:
+    if not out or not out.endswith(".svg") or len(out) <= 4:
         errors.append(f"Ошибка --output: '{out}' должен быть '.svg'.")
     elif any(c in out for c in bad_chars):
         errors.append(f"Ошибка --output: запрещённые символы в '{out}'.")
@@ -345,14 +346,80 @@ def print_results(graph, cycles):
             print(f"  {src} -> {dst} (цикл)")
 
 
+def format_dot_edge(src, dst, cycles, is_rev):
+    a, b = (dst, src) if is_rev else (src, dst)
+    if (src, dst) in cycles:
+        return f'  "{a}" -> "{b}" [color="red", style="dashed"];'
+    return f'  "{a}" -> "{b}";'
+
+
+def generate_dot(graph, cycles, is_rev=False):
+    lines = [
+        "digraph Dependencies {",
+        '  rankdir="LR";',
+        '  node [shape="box", style="rounded,filled", fillcolor="#EFEFEF"];',
+    ]
+    for pkg, deps in graph.items():
+        lines.append(f'  "{pkg}";')
+        for dep in deps:
+            lines.append(format_dot_edge(pkg, dep, cycles, is_rev))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def render_dot_online(dot_str, output_svg):
+    url = "https://quickchart.io/graphviz"
+    payload = json.dumps({"graph": dot_str, "format": "svg"}).encode("utf-8")
+    hdrs = {"Content-Type": "application/json", "User-Agent": "DepGraph/1.0"}
+    req = urllib.request.Request(url, data=payload, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            svg_bytes = resp.read()
+            with open(output_svg, "wb") as f:
+                f.write(svg_bytes)
+            return True
+    except Exception as e:
+        print(f"Ошибка онлайн-рендера SVG: {e}", file=sys.stderr)
+        return False
+
+
+def save_svg(dot_str, output_svg):
+    os.makedirs("results", exist_ok=True)
+    out_path = os.path.join("results", output_svg)
+    dot_file = out_path[:-4] + ".dot"
+    
+    with open(dot_file, "w", encoding="utf-8") as f:
+        f.write(dot_str)
+
+    dot_bin = shutil.which("dot")
+    if dot_bin:
+        cmd = [dot_bin, "-Tsvg", dot_file, "-o", out_path]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            print(f"SVG сохранён в папку results через Graphviz: {out_path}")
+            return
+
+    if render_dot_online(dot_str, out_path):
+        print(f"SVG успешно сохранён в папку results: {out_path} (и {dot_file})")
+    else:
+        print(f"Сохранено только описание DOT: {dot_file}", file=sys.stderr)
+
+
 def main():
     args = create_parser().parse_args()
     validate_args(args)
     start_pkg, graph, cycles = build_dependency_graph(args)
-    if args.reverse == "true":
+    is_rev = args.reverse == "true"
+    if is_rev:
         print_reverse_results(start_pkg, graph, cycles)
     else:
         print_results(graph, cycles)
+
+    if graph:
+        dot_str = generate_dot(graph, cycles, is_rev)
+        print("\nПредставление Graphviz (DOT):")
+        print(dot_str)
+        save_svg(dot_str, args.output)
 
 
 if __name__ == "__main__":
